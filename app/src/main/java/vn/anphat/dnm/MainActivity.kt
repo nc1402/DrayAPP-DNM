@@ -1,6 +1,16 @@
 package vn.anphat.dnm
 
 import android.os.Bundle
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import kotlinx.coroutines.CancellationException
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -37,6 +47,7 @@ import java.nio.charset.StandardCharsets
 private val Blue = Color(0xFF1F6FD6)
 private val Red = Color(0xFFE2231A)
 private val Green = Color(0xFF16825D)
+private const val DEFAULT_SERVER = "http://123.30.76.157:8080"
 private const val D = "Device.DeviceInfo."
 private const val LAN_CLIENTS = "Device.X_001DAA.Monitoring.Clients_List.Clients_List."
 private const val WIFI_CLIENTS = "Device.X_001DAA.System_Maintenance.Management.Wireless_Clients_Overview."
@@ -50,7 +61,40 @@ private fun JSONObject.statusColor() = when(str("status")) { "online" -> Green; 
 private fun prettyUp(value: String): String { val s=value.toLongOrNull() ?: return "—"; return "${s/86400}d ${(s%86400)/3600}h ${(s%3600)/60}m" }
 private fun flat(result: JSONObject): Map<String,String> = buildMap { for(o in result.optJSONArray("objects")?.objects().orEmpty()) { val p=o.optJSONObject("params") ?: continue; for(k in p.keys()) put(o.str("path", "")+k,p.str(k)) } }
 
-private class Controller(private val fixture: JSONObject, private val schema: String, private val url: String? = null, private val password: String = "") {
+private class ServerProfile(context: Context) {
+    private val prefs = context.getSharedPreferences("dnm_controller_profile", Context.MODE_PRIVATE)
+    private val alias = "dnm_controller_password_v1"
+    val url: String get() = prefs.getString("url", DEFAULT_SERVER) ?: DEFAULT_SERVER
+    val autoConnect: Boolean get() = prefs.getBoolean("auto_connect", false)
+    private fun key(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getKey(alias, null) as? SecretKey)?.let { return it }
+        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
+            init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
+        }.generateKey()
+    }
+    fun password(): String = runCatching {
+        val encrypted = prefs.getString("encrypted_password", null) ?: return ""
+        val parts = encrypted.split(":")
+        require(parts.size == 2)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)))
+        String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), StandardCharsets.UTF_8)
+    }.getOrDefault("")
+    fun save(url: String, password: String) {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        val encrypted = Base64.encodeToString(cipher.iv, Base64.NO_WRAP) + ":" +
+            Base64.encodeToString(cipher.doFinal(password.toByteArray(StandardCharsets.UTF_8)), Base64.NO_WRAP)
+        check(prefs.edit().putString("url", url).putString("encrypted_password", encrypted)
+            .putBoolean("auto_connect", true).commit()) { "Không thể lưu Server Profile" }
+    }
+    fun pauseAutoConnect() { prefs.edit().putBoolean("auto_connect", false).apply() }
+}
+
+private class Controller(private val fixture: JSONObject, private val schema: String, private val url: String? = null, private val password: String = "", private val debug: Boolean = false) {
     val localDemo get()=url==null
     private fun endpoint(): URI {
         val u=URI((url ?: error("Demo")).trim().trimEnd('/'))
@@ -58,7 +102,8 @@ private class Controller(private val fixture: JSONObject, private val schema: St
         if(u.scheme=="http") {
             val oct=u.host.split('.').mapNotNull { it.toIntOrNull() }
             val lan=oct.size==4 && oct.all{it in 0..255} && (oct[0]==10 || oct[0]==127 || (oct[0]==192 && oct[1]==168) || (oct[0]==172 && oct[1] in 16..31))
-            require(lan) { "HTTP chỉ dùng cho IPv4 LAN thử nghiệm. Kết nối khác cần HTTPS." }
+            val debugServer = debug && u.host == "123.30.76.157" && u.port == 8080
+            require(lan || debugServer) { "HTTP chỉ dùng cho LAN hoặc server debug đã định sẵn. Kết nối khác cần HTTPS." }
         }
         return u
     }
@@ -101,6 +146,8 @@ private val tabs=listOf(Tab("Tổng quan",Icons.Default.Dashboard),Tab("Thiết 
     val context=LocalContext.current
     val fixture=remember{JSONObject(context.assets.open("demo.json").bufferedReader().use{it.readText()})}
     val schema=remember{context.assets.open("ap905.schema").bufferedReader().use{it.readText()}}
+    val profile=remember{ServerProfile(context.applicationContext)}
+    val debug=(context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE)!=0
     val offline=remember{Controller(fixture,schema)}
     var api by remember{mutableStateOf(offline)}
     var state by remember{mutableStateOf(fixture.getJSONObject("state"))}
@@ -121,8 +168,8 @@ private val tabs=listOf(Tab("Tổng quan",Icons.Default.Dashboard),Tab("Thiết 
     var preview by remember{mutableStateOf(false)}
     var busy by remember{mutableStateOf(false)}
     var errorText by remember{mutableStateOf("")}
-    var server by remember{mutableStateOf("http://192.168.9.100:8080")}
-    var pw by remember{mutableStateOf("")}
+    var server by remember{mutableStateOf(profile.url)}
+    var pw by remember{mutableStateOf(profile.password())}
     var showAdd by remember{mutableStateOf(false)}
     var agentId by remember{mutableStateOf("")}
     var agentName by remember{mutableStateOf("")}
@@ -133,8 +180,26 @@ private val tabs=listOf(Tab("Tổng quan",Icons.Default.Dashboard),Tab("Thiết 
     var pathRead by remember{mutableStateOf(D)}
     var explorerData by remember{mutableStateOf<JSONObject?>(null)}
     val scope=rememberCoroutineScope()
-    fun task(block:suspend ()->Unit){ if(busy)return; busy=true; errorText=""; scope.launch{ try{block()}catch(e:Exception){errorText=e.message?:"Lỗi kết nối"}finally{busy=false} } }
+    fun task(block:suspend ()->Unit){ if(busy)return; busy=true; errorText=""; scope.launch{ try{block()}catch(e:CancellationException){throw e}catch(e:Exception){errorText=e.message?:"Lỗi kết nối"}finally{busy=false} } }
     fun resetSelection(){current=null;section="";detail=null;data=null;clients=null;clientId="";picked=emptySet();preview=false;results=emptyList();explorerData=null}
+    fun connectController(){
+        val target=server.trim().trimEnd('/')
+        val password=pw
+        task{
+            try {
+                val newApi=Controller(fixture,schema,target,password,debug)
+                val s=newApi.state();val ds=newApi.devices();val ps=newApi.pages()
+                api=newApi;state=s;devices=ds;pages=ps;resetSelection();tab=0
+                server=target
+                try { profile.save(target,password) }
+                catch(e:Exception){errorText="Đã kết nối nhưng chưa lưu được Server Profile: "+(e.message?:"lỗi lưu trữ")}
+            } catch(e:CancellationException){throw e}
+            catch(e:Exception){tab=4;throw e}
+        }
+    }
+    LaunchedEffect(Unit){
+        if(profile.autoConnect && pw.isNotBlank()) connectController() else if(!profile.autoConnect) tab=4
+    }
     fun refresh(){task{state=api.state();devices=api.devices(true)}}
     fun openDevice(id:String){current=id;section="";detail=null;data=null;tab=1;task{detail=api.read(id,D)}}
     fun navigate(i:Int){if(busy)return;tab=i;current=null;section="";explorer=false;errorText=""}
@@ -187,9 +252,9 @@ private val tabs=listOf(Tab("Tổng quan",Icons.Default.Dashboard),Tab("Thiết 
                     Panel{Text("Wi-Fi Profile",fontWeight=FontWeight.Bold);OutlinedTextField(ssid,{ssid=it;preview=false},label={Text("SSID dự kiến")},singleLine=true,modifier=Modifier.fillMaxWidth());Button(onClick={preview=true},enabled=picked.isNotEmpty()&&ssid.isNotBlank(),modifier=Modifier.fillMaxWidth()){Text("Xem trước (${picked.size})")};if(preview){Text("SSID: $ssid",fontWeight=FontWeight.Bold);devices.filter{it.str("id") in picked}.forEach{Text("• ${it.model()}")};Text("Không có lệnh SET được gửi. Kiểm tra mapping và quyền ghi ở giai đoạn 4.",color=MaterialTheme.colorScheme.onSurfaceVariant)}}
                 }
                 4->{if(!explorer){
-                    Panel{Text("USP Controller",fontWeight=FontWeight.Bold,fontSize=18.sp);OutlinedTextField(server,{server=it},label={Text("URL Controller")},singleLine=true,modifier=Modifier.fillMaxWidth());OutlinedTextField(pw,{pw=it},label={Text("Mật khẩu web Controller")},singleLine=true,visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth());Text("HTTP chỉ dành cho LAN test. Dùng HTTPS + VPN cho triển khai thực tế. Mật khẩu không lưu vào thiết bị.",fontSize=12.sp);Button(onClick={task{val newApi=Controller(fixture,schema,server,pw);val s=newApi.state();val ds=newApi.devices();val ps=newApi.pages();api=newApi;state=s;devices=ds;pages=ps;resetSelection();tab=0}},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text("Kết nối Controller")};OutlinedButton(onClick={api=offline;state=fixture.getJSONObject("state");devices=fixture.getJSONArray("devices").objects();pages=fixture.getJSONArray("pages").objects();pw="";resetSelection();tab=0},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text("Demo offline")}}
+                    Panel{Text("USP Controller",fontWeight=FontWeight.Bold,fontSize=18.sp);OutlinedTextField(server,{server=it},label={Text("URL Controller")},singleLine=true,modifier=Modifier.fillMaxWidth());OutlinedTextField(pw,{pw=it},label={Text("Mật khẩu web Controller")},singleLine=true,visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth());Text("Server Profile được lưu bảo mật sau khi kết nối thành công. App tự kết nối lại khi khởi động.",fontSize=12.sp);if(server.startsWith("http://"))Text("HTTP debug không mã hóa dữ liệu và mật khẩu trên đường truyền. Chỉ sử dụng thử nghiệm; triển khai thực tế cần HTTPS hoặc VPN.",fontSize=12.sp,color=MaterialTheme.colorScheme.error);Button(onClick={connectController()},enabled=!busy&&server.isNotBlank(),modifier=Modifier.fillMaxWidth()){Text("Kết nối & lưu mặc định")};OutlinedButton(onClick={profile.pauseAutoConnect();api=offline;state=fixture.getJSONObject("state");devices=fixture.getJSONArray("devices").objects();pages=fixture.getJSONArray("pages").objects();resetSelection();tab=0},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text("Demo offline")}}
                     Panel{Text("Quản trị",fontWeight=FontWeight.Bold);OutlinedButton(onClick={explorer=true},enabled=!busy,modifier=Modifier.fillMaxWidth()){Text("TR-369 Explorer (GET)")};OutlinedButton(onClick={showAdd=true},enabled=!busy&&!api.localDemo,modifier=Modifier.fillMaxWidth()){Text("Thêm Agent Endpoint ID")}}
-                    Text("DNM v0.1.0 • Android • TR-369 / USP 1.3",fontSize=12.sp)
+                    Text("DNM v0.1.1 • Android • TR-369 / USP 1.3",fontSize=12.sp)
                 }else{
                     val fallback=devices.firstOrNull()?.str("id")?:"";val target=clientId.takeIf{v->devices.any{it.str("id")==v}}?:fallback
                     Text("Chọn Agent đọc dữ liệu",fontWeight=FontWeight.Bold);devices.forEach{d->FilterChip(selected=target==d.str("id"),onClick={clientId=d.str("id");explorerData=null},label={Text(d.model())})}
